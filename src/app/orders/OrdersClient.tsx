@@ -1,5 +1,4 @@
 // src/app/orders/OrdersClient.tsx
-// updated: 02/21/2026
 'use client';
 
 import Image from 'next/image';
@@ -54,6 +53,14 @@ type ReviewModalState =
       existingReview: MyReviewItem | null;
     };
 
+type RowItem = {
+  menuId: number;
+  menuName: string;
+  quantity: number;
+  price: number;
+  image?: string;
+};
+
 type NormalizedOrderRow = {
   id: number;
   transactionId: string;
@@ -66,14 +73,17 @@ type NormalizedOrderRow = {
   menuIds: number[];
   thumb: string;
 
+  // “preview” (item pertama)
   itemName: string;
   qtyText: string;
+
+  // full list
+  items: RowItem[];
 
   total: number;
 
   existingReview: MyReviewItem | null;
 
-  // Stable key to avoid React collapsing rows
   rowKey: string;
 };
 
@@ -84,11 +94,13 @@ const OrdersClient = () => {
     open: false,
   });
 
+  // Track expanded state per row (transaction+restaurant)
+  const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
+
   // Figma-feel: jangan kebanyakan card numpuk
   const page = 1;
   const limit = 5;
 
-  // Single source of truth for user name + avatar (to match the Header).
   const { data: profileResponse } = useProfileQuery();
   const user = profileResponse?.data ?? null;
 
@@ -101,37 +113,25 @@ const OrdersClient = () => {
     limit,
   });
 
-  // Reviews (needed for Edit mode & 409 avoidance)
   const myReviewsPage = 1;
-  const myReviewsLimit = 50; // enough for matching current list
+  const myReviewsLimit = 50;
   const { data: myReviewsRes } = useMyReviewsQuery(
     { page: myReviewsPage, limit: myReviewsLimit },
-    {
-      enabled: typeof window !== 'undefined', // token gating handled by axios/auth in practice
-    }
+    { enabled: typeof window !== 'undefined' }
   );
 
-  /**
-   * Review binding MUST be per restaurant.
-   * Keying by transactionId only is wrong when 1 transaction includes multiple restaurants.
-   */
   const reviewByTxAndRestaurant = useMemo(() => {
     const list = myReviewsRes?.data.reviews ?? [];
     const map = new Map<string, MyReviewItem>();
 
     for (const r of list) {
-      // IMPORTANT: we assume review has restaurantId.
-      // If your MyReviewItem type doesn't include it yet, add it in src/types/review.ts
-      // based on Swagger response (do NOT guess fields).
       const restaurantId = (r as MyReviewItem & { restaurantId?: number })
         .restaurantId;
 
-      if (typeof r.transactionId !== 'string' || !r.transactionId.trim()) {
+      if (typeof r.transactionId !== 'string' || !r.transactionId.trim())
         continue;
-      }
-      if (typeof restaurantId !== 'number' || !Number.isFinite(restaurantId)) {
+      if (typeof restaurantId !== 'number' || !Number.isFinite(restaurantId))
         continue;
-      }
 
       map.set(makeReviewKey(r.transactionId, restaurantId), r);
     }
@@ -139,16 +139,8 @@ const OrdersClient = () => {
     return map;
   }, [myReviewsRes]);
 
-  /**
-   * Fix core bug:
-   * - Flatten each transaction into rows per restaurant group.
-   * - Total must be per restaurant group (group.subtotal + proportional fees).
-   *   Backend only gives transaction-level pricing for serviceFee/deliveryFee/totalPrice.
-   *   We keep UI stable by allocating fees proportionally by group.subtotal.
-   */
   const normalized = useMemo<NormalizedOrderRow[]>(() => {
     const orders = data?.data.orders ?? [];
-
     const rows: NormalizedOrderRow[] = [];
 
     for (const tx of orders) {
@@ -161,7 +153,6 @@ const OrdersClient = () => {
       const txServiceFee = tx.pricing?.serviceFee ?? 0;
       const txDeliveryFee = tx.pricing?.deliveryFee ?? 0;
 
-      // Guard: if subtotal is invalid, avoid divide-by-zero and just use group.subtotal as total.
       const safeTxSubtotal =
         typeof txSubtotal === 'number' && txSubtotal > 0 ? txSubtotal : 0;
 
@@ -170,14 +161,29 @@ const OrdersClient = () => {
         const restaurantLogo = group.restaurant?.logo;
         const restaurantId = group.restaurant?.id ?? 0;
 
-        const items = Array.isArray(group.items) ? group.items : [];
+        const itemsRaw = Array.isArray(group.items) ? group.items : [];
+
+        const items: RowItem[] = itemsRaw
+          .map((i) => ({
+            menuId: i.menuId,
+            menuName: i.menuName,
+            quantity: i.quantity,
+            price: i.price,
+            image: i.image,
+          }))
+          .filter(
+            (i) =>
+              typeof i.menuId === 'number' &&
+              Number.isFinite(i.menuId) &&
+              typeof i.menuName === 'string'
+          );
+
         const firstItem = items[0];
 
         const itemName = firstItem?.menuName ?? 'Menu';
         const qty = firstItem?.quantity ?? 0;
         const price = firstItem?.price ?? 0;
 
-        // Prefer food image (thumbnail), fallback to restaurant logo
         const thumb = firstItem?.image || restaurantLogo || '';
 
         const qtyText =
@@ -194,8 +200,6 @@ const OrdersClient = () => {
 
         const groupSubtotal = group.subtotal ?? 0;
 
-        // Allocate fees proportionally by subtotal, to keep "Total" per restaurant meaningful.
-        // If subtotal is missing/zero, fallback to groupSubtotal only.
         const ratio =
           safeTxSubtotal > 0 && typeof groupSubtotal === 'number'
             ? groupSubtotal / safeTxSubtotal
@@ -215,7 +219,6 @@ const OrdersClient = () => {
               null)
             : null;
 
-        // Stable row key: (transactionId + restaurantId)
         const rowKey = makeReviewKey(txId, restaurantId);
 
         rows.push({
@@ -229,6 +232,7 @@ const OrdersClient = () => {
           thumb,
           itemName,
           qtyText,
+          items,
           total,
           existingReview,
           rowKey,
@@ -257,6 +261,10 @@ const OrdersClient = () => {
       normalizeText('access token required')
     );
 
+  const toggleExpanded = (rowKey: string) => {
+    setExpandedRows((prev) => ({ ...prev, [rowKey]: !prev[rowKey] }));
+  };
+
   const openReviewModal = (args: {
     transactionId: string;
     restaurantName: string;
@@ -272,12 +280,10 @@ const OrdersClient = () => {
   return (
     <main className='mx-auto w-full max-w-[1200px] px-4 pb-16 pt-10 sm:px-6 lg:px-8'>
       <div className='grid grid-cols-1 gap-6 lg:grid-cols-[260px_1fr] lg:items-start'>
-        {/* Sidebar (desktop only) */}
         <div className='hidden lg:block'>
           <OrdersSidebar userName={userName} avatarUrl={avatarUrl} />
         </div>
 
-        {/* Content */}
         <section>
           <h1 className='text-3xl font-semibold tracking-tight'>My Orders</h1>
 
@@ -359,6 +365,8 @@ const OrdersClient = () => {
               ) : (
                 filtered.map((o) => {
                   const isEdit = Boolean(o.existingReview?.id);
+                  const expanded = Boolean(expandedRows[o.rowKey]);
+                  const extraCount = Math.max(0, o.items.length - 1);
 
                   return (
                     <article
@@ -386,7 +394,7 @@ const OrdersClient = () => {
                         </div>
                       </div>
 
-                      {/* Middle: item */}
+                      {/* Middle: preview item */}
                       <div className='mt-3 flex items-center gap-4'>
                         <div className='relative h-14 w-14 shrink-0 overflow-hidden rounded-xl bg-muted'>
                           {o.thumb ? (
@@ -400,15 +408,66 @@ const OrdersClient = () => {
                           ) : null}
                         </div>
 
-                        <div className='min-w-0'>
+                        <div className='min-w-0 flex-1'>
                           <div className='truncate text-sm font-medium'>
                             {o.itemName}
                           </div>
                           <div className='mt-1 text-sm font-semibold'>
                             {o.qtyText || ''}
                           </div>
+
+                          {/* Expand toggle */}
+                          {extraCount > 0 ? (
+                            <button
+                              type='button'
+                              onClick={() => toggleExpanded(o.rowKey)}
+                              className={cn(
+                                'mt-2 inline-flex items-center text-xs font-medium text-primary',
+                                'hover:underline underline-offset-4',
+                                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2'
+                              )}
+                              aria-expanded={expanded}
+                            >
+                              {expanded
+                                ? 'Hide items'
+                                : `View ${extraCount} more item${
+                                    extraCount > 1 ? 's' : ''
+                                  }`}
+                            </button>
+                          ) : null}
                         </div>
                       </div>
+
+                      {/* Expanded items list */}
+                      {expanded && o.items.length > 1 ? (
+                        <div className='mt-3 rounded-xl border bg-card p-3'>
+                          <div className='space-y-2'>
+                            {o.items.map((it) => {
+                              const lineTotal =
+                                (it.quantity ?? 0) * (it.price ?? 0);
+
+                              return (
+                                <div
+                                  key={it.menuId}
+                                  className='flex items-start justify-between gap-3'
+                                >
+                                  <div className='min-w-0'>
+                                    <div className='truncate text-sm font-medium text-foreground'>
+                                      {it.menuName}
+                                    </div>
+                                    <div className='mt-0.5 text-xs text-muted-foreground'>
+                                      {it.quantity} × {moneyIdr(it.price)}
+                                    </div>
+                                  </div>
+                                  <div className='shrink-0 text-sm font-semibold text-foreground'>
+                                    {moneyIdr(lineTotal)}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ) : null}
 
                       {/* Divider */}
                       <div className='mt-3 h-px w-full bg-border' />
@@ -454,14 +513,15 @@ const OrdersClient = () => {
         </section>
       </div>
 
-      {/* Modal (key ensures clean initial state without effect reset) */}
       {reviewModal.open ? (
         <ReviewModal
           key={`${reviewModal.transactionId}::${reviewModal.restaurantId}::${
             reviewModal.existingReview?.id ?? 'new'
           }`}
           open={reviewModal.open}
-          onClose={closeReviewModal}
+          onClose={() => {
+            closeReviewModal();
+          }}
           transactionId={reviewModal.transactionId}
           restaurantId={reviewModal.restaurantId}
           restaurantName={reviewModal.restaurantName}
